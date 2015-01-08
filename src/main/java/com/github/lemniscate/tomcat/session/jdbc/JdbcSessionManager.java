@@ -404,6 +404,7 @@ private void save(Session session) throws IOException {
             throw e;
         } catch (SQLException e) {
             log.warn("Failed saving with SQLException", e);
+            e.printStackTrace();
             throw new IOException(e);
         } finally {
             currentSession.remove();
@@ -481,6 +482,9 @@ private void save(Session session) throws IOException {
     private synchronized Connection getConnection() throws SQLException {
         if( conn == null || conn.isClosed() ){
             conn = dataSource.getConnection();
+            if( conn.isClosed() ){
+                log.warn("TOMCAT-SESSION-WARNING: retrieved closed connection from DataSource {}", dataSource.getClass().getName());
+            }
         }
         return conn;
     }
