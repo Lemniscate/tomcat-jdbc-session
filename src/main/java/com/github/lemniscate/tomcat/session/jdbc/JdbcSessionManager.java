@@ -7,11 +7,13 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.catalina.*;
 import org.apache.catalina.session.StandardSession;
+import org.springframework.dao.DataAccessException;
 import org.springframework.jdbc.core.BeanPropertyRowMapper;
+import org.springframework.jdbc.core.PreparedStatementCallback;
+import org.springframework.jdbc.core.PreparedStatementCreator;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 
-import javax.sql.DataSource;
 import java.beans.PropertyChangeListener;
 import java.io.BufferedInputStream;
 import java.io.ByteArrayInputStream;
@@ -32,7 +34,6 @@ public class JdbcSessionManager implements Manager, Lifecycle {
 
     private final NamedParameterJdbcTemplate jdbcTemplate;
     private final JdbcSessionTableDetails tableDetails;
-    private final DataSource dataSource;
 
     private LifecycleState state = LifecycleState.NEW;
 
@@ -41,7 +42,6 @@ public class JdbcSessionManager implements Manager, Lifecycle {
 
     private SessionTrackerValve trackerValve;
     private Container container;
-    private Connection conn;
     private Context context;
 
     @Getter
@@ -51,10 +51,9 @@ public class JdbcSessionManager implements Manager, Lifecycle {
     }
 
 
-    public JdbcSessionManager(DataSource dataSource, JdbcSessionTableDetails tableDetails) {
-        this.dataSource = dataSource;
+    public JdbcSessionManager(NamedParameterJdbcTemplate jdbcTemplate, JdbcSessionTableDetails tableDetails) {
         this.tableDetails = tableDetails;
-        this.jdbcTemplate = new NamedParameterJdbcTemplate(dataSource);
+        this.jdbcTemplate = jdbcTemplate;
     }
 
 
@@ -349,8 +348,6 @@ private JdbcSessionDetails lookupSession(String id) {
 }
 
 private void save(Session session) throws IOException {
-    ByteArrayInputStream bis = null;
-    InputStream in = null;
         try {
             log.info("Saving session " + session);
 
@@ -363,49 +360,57 @@ private void save(Session session) throws IOException {
 //                }
 
 
-            String id = standardsession.getId();
-            byte[] obs = serializer.serialize(standardsession);
-            int size = obs.length;
-            bis = new ByteArrayInputStream(obs, 0, size);
-            in = new BufferedInputStream(bis, size);
+            final String id = standardsession.getId();
+            final byte[] obs = serializer.serialize(standardsession);
+            final int size = obs.length;
+
+            final ByteArrayInputStream bis = new ByteArrayInputStream(obs, 0, size);
+            final InputStream in = new BufferedInputStream(bis, size);
 
             JdbcSessionDetails existing = lookupSession(id);
             String sql;
 
-            PreparedStatement stmt;
+
             if( existing == null ){
                 sql = String.format("insert into %s (%s, %s, %s) values (?, ?, ?) ",
-                    tableDetails.getTable(), tableDetails.getIdCol(), tableDetails.getLastAccessCol(), tableDetails.getDataCol() );
+                    tableDetails.getTable(), tableDetails.getLastAccessCol(), tableDetails.getDataCol(), tableDetails.getIdCol() );
                 log.info("Creating session with id " + session.getIdInternal());
-
-                stmt = getConnection().prepareStatement(sql);
-                stmt.setString(1, id);
-                stmt.setLong(2, System.currentTimeMillis() + 1000 * 60 * 60 * 24 );
-                stmt.setBinaryStream(3, in, size);
             }else{
                 sql = String.format("update %s set %s = ?, %s = ? where %s = ? ",
-                        tableDetails.getTable(), tableDetails.getLastAccessCol(), tableDetails.getDataCol(), tableDetails.getIdCol() );
+                        tableDetails.getTable(), tableDetails.getLastAccessCol(), tableDetails.getDataCol(), tableDetails.getIdCol());
                 log.info("Updating session with id " + session.getIdInternal());
-
-                stmt = getConnection().prepareStatement(sql);
-                stmt.setLong(1, System.currentTimeMillis() + 1000 * 60 * 60 * 24 );
-                stmt.setBinaryStream(2, in, size);
-                stmt.setString(3, id);
             }
 
+            final String theSql = sql;
 
-            int r = stmt.executeUpdate();
-            log.info("Processed " + r);
+            int modified = jdbcTemplate.getJdbcOperations().execute(new PreparedStatementCreator() {
+                @Override
+                public PreparedStatement createPreparedStatement(Connection conn) throws SQLException {
+                    PreparedStatement stmt = conn.prepareStatement(theSql);
+                    stmt.setLong(1, System.currentTimeMillis() + 1000 * 60 * 60 * 24);
+                    stmt.setBinaryStream(2, in, size);
+                    stmt.setString(3, id);
+                    return stmt;
+                }
+            }, new PreparedStatementCallback<Integer>() {
+                @Override
+                public Integer doInPreparedStatement(PreparedStatement ps) throws SQLException, DataAccessException {
+                    return ps.executeUpdate();
+                }
+            });
 
+            log.info("Processed {} records", modified);
 
+            try{
+                in.close();
+                bis.close();
+            }catch(IOException e){
+                log.warn("Failed while closing streams", e);
+            }
         } catch (IOException e) {
             log.warn("Failed saving session", e.getMessage());
             e.printStackTrace();
             throw e;
-        } catch (SQLException e) {
-            log.warn("Failed saving with SQLException", e);
-            e.printStackTrace();
-            throw new IOException(e);
         } finally {
             currentSession.remove();
             log.info("Session removed from ThreadLocal :"
@@ -422,7 +427,6 @@ private void save(Session session) throws IOException {
     public void removePropertyChangeListener(PropertyChangeListener propertyChangeListener) {
         throw new UnsupportedOperationException("Not implemented");
     }
-
 
 
     @Override
@@ -476,17 +480,6 @@ private void save(Session session) throws IOException {
         Map<String, Object> params = new HashMap<String, Object>();
         params.put("id", session.getId());
         jdbcTemplate.update(sql, params);
-    }
-
-
-    private synchronized Connection getConnection() throws SQLException {
-        if( conn == null || conn.isClosed() ){
-            conn = dataSource.getConnection();
-            if( conn.isClosed() ){
-                log.warn("TOMCAT-SESSION-WARNING: retrieved closed connection from DataSource {}", dataSource.getClass().getName());
-            }
-        }
-        return conn;
     }
 
 }
